@@ -4048,3 +4048,63 @@ proptest! {
         check_ops_with_options(options, ops);
     }
 }
+
+#[test]
+fn workspace_kept_alive_for_cast_is_not_removed_when_empty() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+        Op::FocusWorkspace(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+    let mut layout = check_ops(ops);
+    // Finish the workspace switch animation so that workspace cleanup can run.
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let cast_ws_id = layout.workspaces().next().unwrap().2.id();
+    layout.set_workspaces_kept_alive_for_cast(&[cast_ws_id]);
+    layout.verify_invariants();
+
+    // Closing the last window on the inactive casted workspace keeps the workspace around.
+    check_ops_on_layout(&mut layout, [Op::CloseWindow(0)]);
+    assert!(layout.find_workspace_by_id(cast_ws_id).is_some());
+
+    // Once the cast stops, the empty workspace is cleaned up as usual.
+    layout.set_workspaces_kept_alive_for_cast(&[]);
+    layout.verify_invariants();
+    assert!(layout.find_workspace_by_id(cast_ws_id).is_none());
+}
+
+#[test]
+fn workspace_cast_view_override_is_restored() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+        Op::FocusWorkspace(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+    let mut layout = check_ops(ops);
+
+    let cast_ws_id = layout.workspaces().next().unwrap().2.id();
+    let active_before = layout.active_workspace().unwrap().id();
+    assert_ne!(active_before, cast_ws_id);
+
+    let (output, saved) = layout.override_view_for_workspace_cast(cast_ws_id).unwrap();
+    {
+        let mon = layout.monitor_for_output(&output).unwrap();
+        assert_eq!(mon.active_workspace_ref().id(), cast_ws_id);
+        assert!(mon.is_view_stationary());
+    }
+    layout.restore_view_after_workspace_cast(&output, saved);
+    layout.verify_invariants();
+
+    assert_eq!(layout.active_workspace().unwrap().id(), active_before);
+}

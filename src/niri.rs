@@ -456,6 +456,12 @@ pub struct Niri {
     pub debug_draw_opaque_regions: bool,
     pub debug_draw_damage: bool,
 
+    /// Whether the current render is for a workspace screencast.
+    ///
+    /// Workspace casts show just the workspace contents and layer-shell surfaces, without
+    /// compositor UI like the screenshot UI or the Alt-Tab switcher.
+    pub rendering_workspace_cast: bool,
+
     #[cfg(feature = "dbus")]
     pub dbus: Option<crate::dbus::DBusServers>,
     #[cfg(feature = "dbus")]
@@ -651,6 +657,10 @@ pub enum CastTarget {
     Window {
         id: u64,
     },
+    /// A workspace, rendered as if it was active on its monitor, even when it's not visible.
+    Workspace {
+        id: WorkspaceId,
+    },
 }
 
 impl CastTarget {
@@ -673,6 +683,9 @@ impl CastTarget {
                 name == ipc_name
             }
             (Window { id }, niri_ipc::CastTarget::Window { id: ipc_id }) => id == ipc_id,
+            (Workspace { id }, niri_ipc::CastTarget::Workspace { id: ipc_id }) => {
+                id.get() == *ipc_id
+            }
             _ => false,
         }
     }
@@ -683,6 +696,7 @@ impl CastTarget {
             Nothing => niri_ipc::CastTarget::Nothing {},
             Output { name, .. } => niri_ipc::CastTarget::Output { name: name.clone() },
             Window { id } => niri_ipc::CastTarget::Window { id: *id },
+            Workspace { id } => niri_ipc::CastTarget::Workspace { id: id.get() },
         }
     }
 }
@@ -890,6 +904,8 @@ impl State {
         // screencasts.
         #[cfg(feature = "xdp-gnome-screencast")]
         self.niri.refresh_mapped_cast_window_rules();
+        #[cfg(feature = "xdp-gnome-screencast")]
+        self.niri.refresh_workspace_cast_keepalive();
         self.ipc_refresh_casts();
 
         self.niri.refresh_window_rules();
@@ -2439,6 +2455,27 @@ impl State {
             },
         );
 
+        // Every workspace shows up as a pseudo-window, so that it can be picked for a workspace
+        // cast in the regular window picker of xdg-desktop-portal-gnome.
+        #[cfg(feature = "xdp-gnome-screencast")]
+        for (mon, idx, ws) in self.niri.layout.workspaces() {
+            let Some(mon) = mon else {
+                continue;
+            };
+
+            let ws_name = match ws.name() {
+                Some(name) => format!("\u{ab}{name}\u{bb}"),
+                None => (idx + 1).to_string(),
+            };
+            windows.insert(
+                crate::screencasting::workspace_cast_window_id(ws.id()),
+                gnome_shell_introspect::WindowProperties {
+                    title: format!("Workspace {ws_name} \u{b7} {}", mon.output_name()),
+                    app_id: String::from("rs.bxt.niri.desktop"),
+                },
+            );
+        }
+
         self.niri.layout.with_windows(|mapped, _, _, _| {
             let id = mapped.id().get();
             let props = with_toplevel_role(mapped.toplevel(), |role| {
@@ -2905,6 +2942,7 @@ impl Niri {
             pick_color: None,
 
             debug_draw_opaque_regions: false,
+            rendering_workspace_cast: false,
             debug_draw_damage: false,
 
             #[cfg(feature = "dbus")]
@@ -4523,20 +4561,25 @@ impl Niri {
             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
         }
 
+        // Workspace screencasts don't show compositor UI.
+        let show_ui = !self.rendering_workspace_cast;
+
         // Next, the screen transition texture.
-        {
+        if show_ui {
             if let Some(transition) = &state.screen_transition {
                 push(transition.render(ctx.target).into());
             }
         }
 
-        // Next, the exit confirm dialog.
-        self.exit_confirm_dialog
-            .render(ctx.renderer, output, &mut |elem| push(elem.into()));
+        if show_ui {
+            // Next, the exit confirm dialog.
+            self.exit_confirm_dialog
+                .render(ctx.renderer, output, &mut |elem| push(elem.into()));
 
-        // Next, the config error notification too.
-        if let Some(element) = self.config_error_notification.render(ctx.renderer, output) {
-            push(element.into());
+            // Next, the config error notification too.
+            if let Some(element) = self.config_error_notification.render(ctx.renderer, output) {
+                push(element.into());
+            }
         }
 
         // If the session is locked, draw the lock surface.
@@ -4577,7 +4620,7 @@ impl Niri {
         .into();
 
         // If the screenshot UI is open, draw it.
-        if self.screenshot_ui.is_open() {
+        if show_ui && self.screenshot_ui.is_open() {
             self.screenshot_ui
                 .render_output(output, ctx.target, &mut |elem| push(elem.into()));
 
@@ -4587,14 +4630,16 @@ impl Niri {
             return;
         }
 
-        // Draw the hotkey overlay on top.
-        if let Some(element) = self.hotkey_overlay.render(ctx.renderer, output) {
-            push(element.into());
-        }
+        if show_ui {
+            // Draw the hotkey overlay on top.
+            if let Some(element) = self.hotkey_overlay.render(ctx.renderer, output) {
+                push(element.into());
+            }
 
-        // Then, the Alt-Tab switcher.
-        self.window_mru_ui
-            .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
+            // Then, the Alt-Tab switcher.
+            self.window_mru_ui
+                .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
+        }
 
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.
@@ -4669,8 +4714,12 @@ impl Niri {
         // When rendering above the top layer, we put the regular monitor elements first.
         // Otherwise, we will render all layer-shell pop-ups and the top layer on top.
         if mon.render_above_top_layer() {
-            self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+            if show_ui {
+                self.layout
+                    .render_interactive_move_for_output(ctx.r(), output, &mut |elem| {
+                        push(elem.into())
+                    });
+            }
 
             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
 
@@ -4692,8 +4741,12 @@ impl Niri {
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
 
-            self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+            if show_ui {
+                self.layout
+                    .render_interactive_move_for_output(ctx.r(), output, &mut |elem| {
+                        push(elem.into())
+                    });
+            }
 
             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
 
@@ -5002,6 +5055,9 @@ impl Niri {
             {
                 // Render and send to PipeWire screencast streams.
                 self.render_for_screen_cast(renderer, output, target_presentation_time);
+
+                // Render workspace casts, including for workspaces not visible on the output.
+                self.render_workspaces_for_screen_cast(renderer, output, target_presentation_time);
 
                 // FIXME: when a window is hidden, it should probably still receive frame callbacks
                 // and get rendered for screen cast. This is currently
@@ -5421,6 +5477,52 @@ impl Niri {
         if let CursorImageStatus::Surface(surface) = self.cursor_manager.cursor_image() {
             send_frames_surface_tree(
                 surface,
+                output,
+                frame_callback_time,
+                FRAME_CALLBACK_THROTTLE,
+                should_send,
+            );
+        }
+    }
+
+    /// Sends frame callbacks to windows of a screencasted workspace.
+    ///
+    /// When the workspace is not visible on its output, its windows don't receive frame callbacks
+    /// through [`Self::send_frame_callbacks`] since they aren't presented to the output. Without
+    /// frame callbacks they would stop drawing, so the screencast would freeze.
+    pub fn send_frame_callbacks_for_workspace_cast(&mut self, output: &Output, id: WorkspaceId) {
+        let _span = tracy_client::span!("Niri::send_frame_callbacks_for_workspace_cast");
+
+        let state = self.output_state.get(output).unwrap();
+        let sequence = state.frame_callback_sequence;
+
+        let should_send = |_surface: &WlSurface, states: &SurfaceData| {
+            // Unlike in send_frame_callbacks(), skip the primary scanout output check: the windows
+            // of a hidden workspace are not presented to any output, but they are visible in the
+            // screencast. Only check the throttling status to avoid sending frame callbacks twice
+            // in one output refresh cycle (e.g. if the workspace is also visible on the output).
+            let frame_throttling_state = states
+                .data_map
+                .get_or_insert(SurfaceFrameThrottlingState::default);
+            let mut last_sent_at = frame_throttling_state.last_sent_at.borrow_mut();
+
+            if let Some((last_output, last_sequence)) = &*last_sent_at {
+                if last_output == output && *last_sequence == sequence {
+                    return None;
+                }
+            }
+
+            *last_sent_at = Some((output.clone(), sequence));
+            Some(output.clone())
+        };
+
+        let frame_callback_time = get_monotonic_time();
+
+        let Some(ws) = self.layout.workspaces_mut().find(|ws| ws.id() == id) else {
+            return;
+        };
+        for mapped in ws.windows_mut() {
+            mapped.send_frame(
                 output,
                 frame_callback_time,
                 FRAME_CALLBACK_THROTTLE,

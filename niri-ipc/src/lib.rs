@@ -1627,6 +1627,14 @@ pub enum CastTarget {
         /// ID of the screencasted window.
         id: u64,
     },
+    /// Casting a workspace.
+    ///
+    /// The workspace is rendered as if it was the active workspace on its monitor, even while it
+    /// is not visible.
+    Workspace {
+        /// ID of the screencasted workspace.
+        id: u64,
+    },
 }
 
 /// A compositor event.

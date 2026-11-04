@@ -797,6 +797,9 @@ fn print_cast(cast: &Cast) {
         CastTarget::Window { id } => {
             println!("  Target: window {id}");
         }
+        CastTarget::Workspace { id } => {
+            println!("  Target: workspace {id}");
+        }
     }
 
     if cast.is_dynamic_target {

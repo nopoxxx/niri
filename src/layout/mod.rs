@@ -53,7 +53,7 @@ use tile::{Tile, TileRenderElement};
 use workspace::{WorkspaceAddWindowTarget, WorkspaceId};
 
 pub use self::monitor::MonitorRenderElement;
-use self::monitor::{Monitor, WorkspaceSwitch};
+use self::monitor::{Monitor, SavedMonitorView, WorkspaceSwitch};
 use self::workspace::{OutputId, Workspace};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
@@ -1312,6 +1312,72 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         None
+    }
+
+    /// Returns the output of the monitor that currently has the workspace with this id.
+    pub fn output_for_workspace_id(&self, id: WorkspaceId) -> Option<&Output> {
+        let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
+            return None;
+        };
+        monitors
+            .iter()
+            .find(|mon| mon.idx_of_ws(id).is_some())
+            .map(|mon| mon.output())
+    }
+
+    /// Keeps the given workspaces alive (not removed when empty) for screencasting.
+    ///
+    /// Workspaces not in `ids` stop being kept alive, and are cleaned up if they are empty.
+    pub fn set_workspaces_kept_alive_for_cast(&mut self, ids: &[WorkspaceId]) {
+        match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => {
+                for mon in monitors {
+                    let mut released = false;
+                    for ws in &mut mon.workspaces {
+                        let value = ids.contains(&ws.id());
+                        if ws.kept_alive_for_cast && !value {
+                            released = true;
+                        }
+                        ws.kept_alive_for_cast = value;
+                    }
+
+                    if released && mon.workspace_switch.is_none() {
+                        mon.clean_up_workspaces();
+                    }
+                }
+            }
+            MonitorSet::NoOutputs { workspaces } => {
+                for ws in workspaces.iter_mut() {
+                    ws.kept_alive_for_cast = ids.contains(&ws.id());
+                }
+            }
+        }
+    }
+
+    /// Switches the monitor holding this workspace to a stationary view of it.
+    ///
+    /// Returns `None` if the workspace is not on any monitor. Otherwise, the view must be restored
+    /// with [`Self::restore_view_after_workspace_cast`].
+    pub fn override_view_for_workspace_cast(
+        &mut self,
+        id: WorkspaceId,
+    ) -> Option<(Output, SavedMonitorView)> {
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return None;
+        };
+        let mon = monitors
+            .iter_mut()
+            .find(|mon| mon.idx_of_ws(id).is_some())?;
+        let idx = mon.idx_of_ws(id).unwrap();
+        let saved = mon.override_view_for_cast(idx);
+        Some((mon.output().clone(), saved))
+    }
+
+    pub fn restore_view_after_workspace_cast(&mut self, output: &Output, saved: SavedMonitorView) {
+        let mon = self
+            .monitor_for_output_mut(output)
+            .expect("monitor must not disappear during workspace cast rendering");
+        mon.restore_view(saved);
     }
 
     pub fn find_workspace_by_name(&self, workspace_name: &str) -> Option<(usize, &Workspace<W>)> {

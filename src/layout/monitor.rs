@@ -1,5 +1,6 @@
 use std::cmp::min;
 use std::iter::zip;
+use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -89,6 +90,15 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) options: Rc<Options>,
     /// Layout config overrides for this monitor.
     layout_config: Option<niri_config::LayoutPart>,
+}
+
+/// Monitor view state saved while rendering a workspace for a screencast.
+#[derive(Debug)]
+pub struct SavedMonitorView {
+    active_workspace_idx: usize,
+    workspace_switch: Option<WorkspaceSwitch>,
+    overview_progress: Option<OverviewProgress>,
+    insert_hint_render_loc: Option<InsertHintRenderLoc>,
 }
 
 #[derive(Debug)]
@@ -1077,6 +1087,11 @@ impl<W: LayoutElement> Monitor<W> {
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
+    /// Whether the view is not moving between workspaces and the overview is closed.
+    pub fn is_view_stationary(&self) -> bool {
+        self.workspace_switch.is_none() && self.overview_progress.is_none()
+    }
+
     pub fn are_transitions_ongoing(&self) -> bool {
         self.workspace_switch.is_some()
             || self
@@ -1649,6 +1664,27 @@ impl<W: LayoutElement> Monitor<W> {
 
         let ws = &self.workspaces[self.active_workspace_idx];
         ws.fullscreen_window_above_top_layer()
+    }
+
+    /// Temporarily switches the monitor view to a stationary view of the workspace at `idx`.
+    ///
+    /// Used to render a workspace for a screencast as if it was the active workspace, regardless
+    /// of what is currently shown on the monitor. Must be followed by [`Self::restore_view`].
+    pub fn override_view_for_cast(&mut self, idx: usize) -> SavedMonitorView {
+        SavedMonitorView {
+            active_workspace_idx: mem::replace(&mut self.active_workspace_idx, idx),
+            workspace_switch: self.workspace_switch.take(),
+            overview_progress: self.overview_progress.take(),
+            insert_hint_render_loc: self.insert_hint_render_loc.take(),
+        }
+    }
+
+    /// Restores the monitor view saved by [`Self::override_view_for_cast`].
+    pub fn restore_view(&mut self, saved: SavedMonitorView) {
+        self.active_workspace_idx = saved.active_workspace_idx;
+        self.workspace_switch = saved.workspace_switch;
+        self.overview_progress = saved.overview_progress;
+        self.insert_hint_render_loc = saved.insert_hint_render_loc;
     }
 
     pub fn render_above_top_layer(&self) -> bool {
