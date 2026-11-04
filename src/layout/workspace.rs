@@ -107,6 +107,12 @@ pub struct Workspace<W: LayoutElement> {
     /// Optional name of this workspace.
     pub(super) name: Option<String>,
 
+    /// Whether this workspace is kept alive because it is being screencasted.
+    ///
+    /// A screencasted workspace behaves like a named one: it isn't removed when it becomes empty,
+    /// so the cast doesn't suddenly lose its target.
+    pub(super) kept_alive_for_cast: bool,
+
     /// Layout config overrides for this workspace.
     layout_config: Option<niri_config::LayoutPart>,
 
@@ -274,6 +280,7 @@ impl<W: LayoutElement> Workspace<W> {
             base_options,
             options,
             name: config.map(|c| c.name.0),
+            kept_alive_for_cast: false,
             layout_config,
             id: WorkspaceId::next(),
         }
@@ -336,6 +343,7 @@ impl<W: LayoutElement> Workspace<W> {
             base_options,
             options,
             name: config.map(|c| c.name.0),
+            kept_alive_for_cast: false,
             layout_config,
             id: WorkspaceId::next(),
         }
@@ -358,7 +366,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn has_windows_or_name(&self) -> bool {
-        self.has_windows() || self.name.is_some()
+        self.has_windows() || self.name.is_some() || self.kept_alive_for_cast
     }
 
     pub fn scale(&self) -> smithay::output::Scale {

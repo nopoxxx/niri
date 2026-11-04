@@ -1,0 +1,84 @@
+# Maintainer: nopox
+#
+# niri with workspace screencasting (pick a workspace in the regular xdg-desktop-portal-gnome
+# window picker). Replaces the regular niri package.
+#
+# Build and install:
+#   cd packaging/arch && makepkg -si
+
+pkgname=niri-workspace-cast-git
+_pkgname=niri
+pkgver=r0.0000000
+pkgrel=1
+pkgdesc="Scrollable-tiling Wayland compositor (fork with workspace screencasting)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/nopoxxx/niri"
+license=('GPL-3.0-or-later')
+depends=(
+  'cairo'
+  'gcc-libs'
+  'glib2'
+  'glibc'
+  'libdisplay-info'
+  'libinput'
+  'libpipewire'
+  'libxkbcommon'
+  'mesa'
+  'pango'
+  'pixman'
+  'seatd'
+  'systemd-libs'
+)
+makedepends=('cargo' 'clang' 'git')
+optdepends=(
+  'xdg-desktop-portal-gnome: screencasting, including workspace screencasting'
+  'xdg-desktop-portal-gtk: file chooser and other portals'
+  'xwayland-satellite: Xwayland support'
+)
+provides=('niri')
+conflicts=('niri')
+options=('!lto')
+source=("$_pkgname::git+https://github.com/nopoxxx/niri.git#branch=workspace-cast")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+
+  ./target/release/niri completions bash > niri.bash
+  ./target/release/niri completions fish > niri.fish
+  ./target/release/niri completions zsh > _niri
+}
+
+check() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release --lib
+}
+
+package() {
+  cd "$_pkgname"
+  install -Dm755 target/release/niri "$pkgdir/usr/bin/niri"
+  install -Dm755 resources/niri-session "$pkgdir/usr/bin/niri-session"
+  install -Dm644 resources/niri.desktop "$pkgdir/usr/share/wayland-sessions/niri.desktop"
+  install -Dm644 resources/niri-portals.conf "$pkgdir/usr/share/xdg-desktop-portal/niri-portals.conf"
+  install -Dm644 resources/niri.service "$pkgdir/usr/lib/systemd/user/niri.service"
+  install -Dm644 resources/niri-shutdown.target "$pkgdir/usr/lib/systemd/user/niri-shutdown.target"
+
+  install -Dm644 niri.bash "$pkgdir/usr/share/bash-completion/completions/niri"
+  install -Dm644 niri.fish "$pkgdir/usr/share/fish/vendor_completions.d/niri.fish"
+  install -Dm644 _niri "$pkgdir/usr/share/zsh/site-functions/_niri"
+}

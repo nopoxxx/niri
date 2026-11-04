@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -12,10 +13,11 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::gbm::Modifier;
-use smithay::utils::{DeviceFd, Physical, Point, Scale, Size};
+use smithay::utils::{DeviceFd, Logical, Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
+use crate::layout::workspace::WorkspaceId;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
 use crate::render_helpers::{RenderCtx, RenderTarget};
@@ -24,6 +26,21 @@ use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
 mod pw_utils;
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
+
+/// Flag set on pseudo-window IDs that represent workspaces in the xdp-gnome window picker.
+///
+/// Real window IDs come from a counter starting at 1, so they never get anywhere close to this.
+const WORKSPACE_CAST_ID_FLAG: u64 = 1 << 62;
+
+/// Returns the pseudo-window ID used for a workspace in the xdp-gnome window picker.
+pub fn workspace_cast_window_id(id: WorkspaceId) -> u64 {
+    WORKSPACE_CAST_ID_FLAG | id.get()
+}
+
+/// Returns the workspace ID if this is a workspace pseudo-window ID.
+pub fn workspace_id_from_cast_window_id(id: u64) -> Option<WorkspaceId> {
+    (id & WORKSPACE_CAST_ID_FLAG != 0).then(|| WorkspaceId::specific(id & !WORKSPACE_CAST_ID_FLAG))
+}
 
 pub struct Screencasting {
     pub casts: Vec<Cast>,
@@ -165,6 +182,13 @@ impl State {
                 }
                 return;
             }
+            CastTarget::Workspace { id } => {
+                if let Some(output) = self.niri.layout.output_for_workspace_id(*id) {
+                    let output = output.clone();
+                    self.niri.queue_redraw(&output);
+                }
+                return;
+            }
             CastTarget::Window { id } => *id,
         };
 
@@ -278,6 +302,11 @@ impl State {
                     }
                 }
             }
+            CastTarget::Workspace { id } => {
+                if let Some(output) = self.niri.layout.output_for_workspace_id(*id) {
+                    refresh = Some(output.current_mode().unwrap().refresh as u32);
+                }
+            }
         }
 
         let mut to_redraw = Vec::new();
@@ -332,6 +361,12 @@ impl State {
                     return;
                 };
                 (size, refresh)
+            }
+            CastTarget::Workspace { id } => {
+                let Some(output) = self.niri.layout.output_for_workspace_id(*id) else {
+                    return;
+                };
+                cast_params_for_output(output)
             }
         };
 
@@ -422,6 +457,19 @@ impl State {
                         });
                         return;
                     }
+                    StreamTargetId::Window { id }
+                        if workspace_id_from_cast_window_id(id).is_some() =>
+                    {
+                        let ws_id = workspace_id_from_cast_window_id(id).unwrap();
+                        let Some(output) = self.niri.layout.output_for_workspace_id(ws_id) else {
+                            warn!("error starting screencast: requested workspace is missing");
+                            self.niri.stop_cast(session_id);
+                            return;
+                        };
+
+                        let (size, refresh) = cast_params_for_output(output);
+                        (CastTarget::Workspace { id: ws_id }, size, refresh, false)
+                    }
                     StreamTargetId::Window { id } => {
                         let Some((size, refresh)) = self.niri.cast_params_for_window(id) else {
                             warn!("error starting screencast: requested window is missing");
@@ -481,6 +529,19 @@ impl Niri {
                 .any(|cast| cast.target == (CastTarget::Window { id }));
             mapped.set_is_window_cast_target(value);
         });
+    }
+
+    pub fn refresh_workspace_cast_keepalive(&mut self) {
+        // Find regardless of cast.is_active.
+        let mut ids = Vec::new();
+        for cast in &self.casting.casts {
+            if let CastTarget::Workspace { id } = cast.target {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        self.layout.set_workspaces_kept_alive_for_cast(&ids);
     }
 
     pub fn refresh_mapped_cast_outputs(&mut self) {
@@ -619,6 +680,141 @@ impl Niri {
         for id in casts_to_stop {
             self.stop_cast(id);
         }
+    }
+
+    /// Renders workspace casts whose workspace is currently on this output.
+    ///
+    /// The workspace is rendered as if it was the active, stationary workspace on the output, so
+    /// the cast keeps showing it even when the user switches to a different workspace.
+    pub fn render_workspaces_for_screen_cast(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        output: &Output,
+        target_presentation_time: Duration,
+    ) {
+        let _span = tracy_client::span!("Niri::render_workspaces_for_screen_cast");
+
+        let (size, refresh) = cast_params_for_output(output);
+        let scale = Scale::from(output.current_scale().fractional_scale());
+
+        let mut casts_to_stop = vec![];
+        let mut rendered_workspaces = vec![];
+
+        let mut casts = mem::take(&mut self.casting.casts);
+        for cast in &mut casts {
+            if !cast.is_active() {
+                continue;
+            }
+
+            let CastTarget::Workspace { id } = cast.target else {
+                continue;
+            };
+
+            if self.layout.output_for_workspace_id(id) != Some(output) {
+                continue;
+            }
+
+            // The workspace could have moved to a different output.
+            if let Err(err) = cast.set_refresh(refresh) {
+                warn!("error changing cast FPS, stopping screencast: {err:?}");
+                casts_to_stop.push(cast.session_id);
+                continue;
+            }
+
+            match cast.ensure_size(size) {
+                Ok(CastSizeChange::Ready) => (),
+                Ok(CastSizeChange::Pending) => continue,
+                Err(err) => {
+                    warn!("error updating stream size, stopping screencast: {err:?}");
+                    casts_to_stop.push(cast.session_id);
+                    continue;
+                }
+            }
+
+            if cast.check_time_and_schedule(output, target_presentation_time) {
+                continue;
+            }
+
+            let mut elements = Vec::new();
+            let pointer_pos =
+                self.render_workspace_for_screen_cast(renderer, output, id, &mut |elem| {
+                    elements.push(CastRenderElement::from(elem))
+                });
+            let Some((pointer_pos, main_start)) = pointer_pos else {
+                continue;
+            };
+
+            let cursor_data = CursorData::compute(&elements, main_start, pointer_pos, scale);
+            if cast.dequeue_buffer_and_render(renderer, &elements, &cursor_data, size, scale) {
+                cast.record_frame_time(target_presentation_time);
+            }
+
+            if !rendered_workspaces.contains(&id) {
+                rendered_workspaces.push(id);
+            }
+        }
+        self.casting.casts = casts;
+
+        for id in casts_to_stop {
+            self.stop_cast(id);
+        }
+
+        for id in rendered_workspaces {
+            self.send_frame_callbacks_for_workspace_cast(output, id);
+        }
+    }
+
+    /// Renders a workspace as if it was the active workspace on the output.
+    ///
+    /// Returns the pointer position relative to the output and the index of the first
+    /// non-pointer element, or `None` if the workspace is not on this output.
+    fn render_workspace_for_screen_cast(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        output: &Output,
+        id: WorkspaceId,
+        push: &mut dyn FnMut(OutputRenderElements<GlesRenderer>),
+    ) -> Option<(Point<f64, Logical>, usize)> {
+        let mon = self.layout.monitor_for_output(output)?;
+        mon.idx_of_ws(id)?;
+
+        // Only show the pointer when the workspace is currently shown on the output, otherwise
+        // the pointer is somewhere else entirely.
+        let is_shown = mon.active_workspace_ref().id() == id && mon.is_view_stationary();
+
+        let count = Cell::new(0);
+        let mut push = |elem| {
+            count.set(count.get() + 1);
+            push(elem)
+        };
+
+        let mut pointer_pos = Point::default();
+        if is_shown && self.pointer_visibility.is_visible() {
+            let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
+            let pointer_loc = self
+                .tablet_cursor_location
+                .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+            if output_geo.contains(pointer_loc) {
+                pointer_pos = pointer_loc - output_geo.loc;
+                self.render_pointer(renderer, output, &mut |elem| push(elem.into()));
+            }
+        }
+        let main_start = count.get();
+
+        let (_, saved) = self.layout.override_view_for_workspace_cast(id)?;
+        self.rendering_workspace_cast = true;
+
+        let ctx = RenderCtx {
+            renderer,
+            target: RenderTarget::Screencast,
+            xray: None,
+        };
+        self.render(ctx, output, false, &mut push);
+
+        self.rendering_workspace_cast = false;
+        self.layout.restore_view_after_workspace_cast(output, saved);
+
+        Some((pointer_pos, main_start))
     }
 
     pub fn render_windows_for_screen_cast(
