@@ -1,4 +1,7 @@
 <h1 align="center"><img alt="niri" src="https://github.com/user-attachments/assets/07d05cd0-d5dc-4a28-9a35-51bae8f119a0"></h1>
+
+> **Форк:** эта версия умеет транслировать отдельный воркспейс. См. [WORKSPACE_CAST.md](WORKSPACE_CAST.md).
+
 <p align="center">A scrollable-tiling Wayland compositor.</p>
 <p align="center">
     <a href="https://matrix.to/#/#niri:matrix.org"><img alt="Matrix" src="https://img.shields.io/badge/matrix-%23niri-blue?logo=matrix"></a>
